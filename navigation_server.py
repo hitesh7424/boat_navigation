@@ -1,138 +1,154 @@
 # navigation_server.py
-"""
-Navigation Decision Server
-- Integrates ultrasonic, GPS, compass, and waste direction sensors
-- Hosts REST API on port 8008 at /navigate
-- Provides safe, failsafe navigation direction for the boat
-- Falls back to camera-based navigation if sensors fail
-"""
+# RESTful navigation decision system for autonomous pond boat
+# Gathers sensor and vision data, computes optimal movement direction
 
 import requests
-import time
-import json
 import cv2
 import numpy as np
-from flask import Flask, jsonify
-from threading import Lock
-
-# --- Configuration ---
-VIDEO_STREAM = "http://localhost:8001/video_feed"
-DIRECTION_API = "http://localhost:8002/analyze"
-ULTRASONIC_API = "http://localhost:8004/distance"
-COMPASS_API = "http://localhost:8005/heading"
-GPS_API = "http://localhost:8006/location"
-
-SAFE_DISTANCE_CM = 100
-TIMEOUT = 2
+from flask import Flask, jsonify, Response
+import time
 
 app = Flask(__name__)
-status_lock = Lock()
 
-# --- Helper: get JSON safely ---
-def get_json(url):
-    try:
-        r = requests.get(url, timeout=TIMEOUT)
-        if r.ok:
-            return r.json()
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch {url}: {e}")
-    return None
+# ---------------------------- Configuration ----------------------------
+VIDEO_FEED_URL = "http://localhost:8001/video_feed"
+WASTE_DIRECTION_URL = "http://localhost:8002/analyze"
+ULTRASONIC_URL = "http://localhost:8004/distance"
+COMPASS_URL = "http://localhost:8005/heading"
+GPS_URL = "http://localhost:8006/location"
 
-# --- Helper: get camera frame ---
-def get_video_frame():
+SAFE_DISTANCE_CM = 100   # Boat is 1.5m wide, 2.5m long
+BOAT_PORT = 8008
+
+# ---------------------------- Helper Functions ----------------------------
+def fetch_json(url, timeout=1.5):
     try:
-        stream = requests.get(VIDEO_STREAM, stream=True, timeout=5)
-        byte_data = b''
+        res = requests.get(url, timeout=timeout)
+        return res.json()
+    except:
+        return None
+
+def is_ultrasonic_safe(distances):
+    if not distances:
+        return False
+    for pos, dist in distances.items():
+        if dist is None or dist < SAFE_DISTANCE_CM:
+            return False
+    return True
+
+def fetch_video_frame():
+    try:
+        stream = requests.get(VIDEO_FEED_URL, stream=True, timeout=3)
+        byte_data = bytes()
         for chunk in stream.iter_content(chunk_size=1024):
             byte_data += chunk
-            start = byte_data.find(b'\xff\xd8')
-            end = byte_data.find(b'\xff\xd9')
-            if start != -1 and end != -1:
-                jpg = byte_data[start:end+2]
-                byte_data = byte_data[end+2:]
-                img_array = np.frombuffer(jpg, dtype=np.uint8)
-                return cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-    except Exception as e:
-        print(f"[ERROR] Camera feed unavailable: {e}")
-    return None
+            a = byte_data.find(b'\xff\xd8')
+            b = byte_data.find(b'\xff\xd9')
+            if a != -1 and b != -1:
+                jpg = byte_data[a:b+2]
+                byte_data = byte_data[b+2:]
+                frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                return frame
+    except:
+        return None
 
-# --- Helper: Fallback camera navigation (placeholder) ---
-def camera_fallback_direction(frame):
-    # TODO: Replace with actual camera-based logic
-    h, w = frame.shape[:2]
-    center_color = frame[h//2, w//2].tolist()
-    print("[INFO] Vision fallback active, center pixel:", center_color)
-    return "FORWARD", 0.5, "Fallback vision center"
+# ---------------------------- Vision Fallback ----------------------------
+def fallback_camera_direction(frame):
+    if frame is None:
+        return "STOP", 0.0, "Camera feed unavailable"
 
-# --- Main API: Decide navigation ---
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (30, 30, 30), (180, 255, 255))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return "FORWARD", 0.5, "No major obstacle visually"
+
+    left, center, right = 0, 0, 0
+    width = frame.shape[1]
+    for cnt in contours:
+        x, _, w, _ = cv2.boundingRect(cnt)
+        cx = x + w//2
+        if cx < width // 3:
+            left += 1
+        elif cx < 2 * width // 3:
+            center += 1
+        else:
+            right += 1
+
+    direction = min((left, "RIGHT"), (center, "FORWARD"), (right, "LEFT"))[1]
+    confidence = 0.6 if center == 0 else 0.8
+    reason = "Visual fallback used to navigate around obstacles"
+    return direction, confidence, reason
+
+# ---------------------------- Main Navigation Endpoint ----------------------------
 @app.route("/navigate", methods=["GET"])
 def navigate():
-    sensor_ok = {"ultrasonic": False, "gps": False, "compass": False}
     result = {
         "direction": "STOP",
-        "mode": "failsafe",
+        "mode": "normal",
         "confidence": 0.0,
-        "reason": "No sensors available",
-        "sensor_status": sensor_ok
+        "reason": "unknown",
+        "sensor_status": {
+            "ultrasonic": False,
+            "compass": False,
+            "gps": False
+        }
     }
 
-    # --- Get all sensor data ---
-    direction_data = get_json(DIRECTION_API)
-    distance_data = get_json(ULTRASONIC_API)
-    compass_data = get_json(COMPASS_API)
-    gps_data = get_json(GPS_API)
+    # Fetch direction from waste detector
+    waste_data = fetch_json(WASTE_DIRECTION_URL)
+    direction = waste_data.get("direction") if waste_data else None
 
-    # --- Update status ---
-    sensor_ok["ultrasonic"] = bool(distance_data)
-    sensor_ok["compass"] = bool(compass_data and compass_data.get("heading") is not None)
-    sensor_ok["gps"] = bool(gps_data and gps_data.get("lat") is not None)
+    # Fetch ultrasonic data
+    distances = fetch_json(ULTRASONIC_URL)
+    ultrasonic_ok = is_ultrasonic_safe(distances)
+    result["sensor_status"]["ultrasonic"] = ultrasonic_ok
 
-    # --- Check ultrasonic obstacle ---
-    if distance_data:
-        too_close = any(v is not None and v < SAFE_DISTANCE_CM for v in distance_data.values())
-        if too_close:
-            result.update({
-                "direction": "STOP",
-                "mode": "normal",
-                "confidence": 0.9,
-                "reason": "Obstacle too close",
-                "sensor_status": sensor_ok
-            })
-            return jsonify(result)
+    # Fetch compass heading
+    compass = fetch_json(COMPASS_URL)
+    compass_ok = compass is not None and compass.get("heading") is not None
+    result["sensor_status"]["compass"] = compass_ok
 
-    # --- If waste direction available and no block ---
-    if direction_data and direction_data.get("direction"):
+    # Fetch GPS location
+    gps = fetch_json(GPS_URL)
+    gps_ok = gps is not None and gps.get("lat") and gps.get("lon")
+    result["sensor_status"]["gps"] = gps_ok
+
+    # Fail-safe logic
+    if not ultrasonic_ok or not compass_ok or not gps_ok:
+        frame = fetch_video_frame()
+        fallback_dir, conf, reason = fallback_camera_direction(frame)
         result.update({
-            "direction": direction_data["direction"],
-            "mode": "normal",
-            "confidence": 0.95,
-            "reason": "All sensors nominal",
-            "sensor_status": sensor_ok
-        })
-        return jsonify(result)
-
-    # --- Vision fallback ---
-    frame = get_video_frame()
-    if frame is not None:
-        vision_dir, conf, reason = camera_fallback_direction(frame)
-        result.update({
-            "direction": vision_dir,
+            "direction": fallback_dir,
             "mode": "vision_fallback",
             "confidence": conf,
-            "reason": reason,
-            "sensor_status": sensor_ok
+            "reason": reason
         })
         return jsonify(result)
 
-    # --- Emergency stop ---
-    result["direction"] = "STOP"
-    result["reason"] = "No valid sensors or fallback"
+    # All sensors OK → Use waste direction
+    if direction:
+        result.update({
+            "direction": direction,
+            "confidence": 0.95,
+            "reason": "Sensor data valid, waste direction used"
+        })
+    else:
+        result.update({
+            "direction": "FORWARD",
+            "confidence": 0.5,
+            "reason": "Waste detection unavailable, assuming FORWARD"
+        })
+
     return jsonify(result)
 
+# ---------------------------- Health Check ----------------------------
 @app.route("/ping")
 def ping():
-    return "Navigation server online"
+    return "Navigation system online"
 
+# ---------------------------- Server Launch ----------------------------
 if __name__ == "__main__":
-    print("🧭 Navigation server running on http://<ip>:8008/navigate")
-    app.run(host="0.0.0.0", port=8008, threaded=True)
+    print(f"🚀 Navigation server running at http://0.0.0.0:{BOAT_PORT}/navigate")
+    app.run(host="0.0.0.0", port=BOAT_PORT, threaded=True)

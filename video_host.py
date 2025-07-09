@@ -2,7 +2,7 @@
 import time
 import cv2
 import platform
-from flask import Flask, Response
+from flask import Flask, Response, send_from_directory
 import threading
 
 # Platform detection
@@ -55,15 +55,30 @@ def video_feed():
     return Response(generate_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
+@app.route('/icon')
+def favicon():
+    return send_from_directory('static', 'boat.png', mimetype='image/vnd.microsoft.icon')
+
 @app.route('/')
 def index():
     return '''
     <html>
-        <head><title>Universal Camera Stream (640x480)</title></head>
-        <body>
-            <h2>Live Stream</h2>
-            <img src="/video_feed">
-        </body>
+
+    <head>
+        <link rel="shortcut icon" href="/icon" type="image/x-icon">
+        <title>Universal Camera Stream (640x480)</title>
+    </head>
+
+    <body>
+        <style>
+            h2 img {
+                height: 1rem;
+            }
+        </style>
+        <h2><img src="/icon" alt="BOAT"> Live Stream</h2>
+        <img src="/video_feed">
+    </body>
+
     </html>
     '''
 
